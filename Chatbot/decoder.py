@@ -1,0 +1,89 @@
+import torch.nn as nn
+import torch
+import torch.nn.functional as F
+
+
+SOS_token = 1
+USE_CUDA = torch.cuda.is_available()
+device = torch.device("cuda" if USE_CUDA else "cpu")
+
+
+# Luong attention layer
+class Attn(nn.Module):
+    def __init__(self, method, hidden_size):
+        super(Attn, self).__init__()
+        self.method = method
+        if self.method not in ['dot', 'general', 'concat']:
+            raise ValueError(self.method, 'is not an appropriate attention method.')
+        self.hidden_size = hidden_size
+        if self.method == 'general':
+            self.attn = nn.Linear(self.hidden_size, hidden_size)
+        elif self.method == 'concat':
+            self.attn = nn.Linear(self.hidden_size*2, hidden_size)
+            self.v = nn.Parameter(torch.FloatTensor(hidden_size))
+
+    def dot_score(self, hidden, encoder_output):
+        return torch.sum(hidden * encoder_output, dim=2)
+
+    def general_score(self, hidden, encoder_output):
+        energy = self.attn(encoder_output)
+        return torch.sum(hidden * energy, dim=2)
+
+    def concat_score(self, hidden, encoder_output):
+        energy = self.attn(torch.cat((hidden.expand(encoder_output.size(0), -1, -1), encoder_output), 2)).tanh()
+        # hidden第一个维度是1 扩展到encoder_output第一个维度大小 然后在最后一个维度合并
+        return torch.sum(self.v * energy, dim=2)
+
+    def forward(self, hidden, encoder_outputs):
+        if self.method == 'general':
+            attn_energies = self.general_score(hidden, encoder_outputs)
+        elif self.method == 'concat':
+            attn_energies = self.concat_score(hidden, encoder_outputs)
+        elif self.method == 'dot':
+            attn_energies = self.dot_score(hidden, encoder_outputs)
+
+        # Transpose max_length and batch_size dimensions
+        attn_energies = attn_energies.t()
+
+        return F.softmax(attn_energies, dim=1).unsqueeze(1)  # [batch, 1, max_len]
+
+
+class LuongAttnDecoderRNN(nn.Module):
+    def __init__(self, attn_model, embedding, hidden_size, output_size, n_layers=1, dropout=0.1):
+        super(LuongAttnDecoderRNN, self).__init__()
+        self.attn_model = attn_model
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.n_layers = n_layers
+        self.dropout = dropout
+
+        self.embedding = embedding
+        self.embedding_dropout = nn.Dropout(dropout)
+        self.gru = nn.GRU(hidden_size, hidden_size, n_layers, dropout=(0 if n_layers == 1 else dropout))
+        self.concat = nn.Linear(hidden_size * 2, hidden_size)
+        self.out = nn.Linear(hidden_size, output_size)
+        self.attn = Attn(attn_model, hidden_size)
+
+    def forward(self, input_step, last_hidden, encoder_outputs):
+        embedded = self.embedding(input_step)
+        embedded = self.embedding_dropout(embedded)
+
+        rnn_output, hidden = self.gru(embedded, last_hidden)
+        # [1, batch, hidden], [n_layers, batch, hidden]
+
+        attn_weights = self.attn(rnn_output, encoder_outputs)
+        # [1, batch, hidden], [max_len, batch, hidden] = [batch, 1, max_len]
+
+        context = attn_weights.bmm(encoder_outputs.transpose(0, 1))
+        # [batch, 1, max_len] * [batch, max_len, hidden] = [batch, 1, hidden]
+
+        rnn_output = rnn_output.squeeze(0)  # [batch, hidden]
+        context = context.squeeze(1)  # [batch, hidden]
+
+        concat_input = torch.cat((rnn_output, context), 1)  # [batch, hidden*2]
+        concat_output = torch.tanh(self.concat(concat_input))  # [batch, hidden]
+
+        output = self.out(concat_output)  # [batch_size, voc.num_words]
+        output = F.softmax(output, dim=1)
+
+        return output, hidden
